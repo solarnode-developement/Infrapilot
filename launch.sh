@@ -25,10 +25,10 @@ NODES=()
 ############################################
 
 require_deps() {
-  for cmd in jq ssh curl whiptail sha256sum; do
+  for cmd in jq ssh curl sha256sum; do
     command -v "$cmd" >/dev/null 2>&1 || {
-      echo "[InfraPilot] installing $cmd..."
-      apt update && apt install -y jq openssh-client curl whiptail coreutils || true
+      echo "[InfraPilot] Installing missing: $cmd"
+      apt update && apt install -y jq curl openssh-client coreutils || true
     }
   done
 }
@@ -43,7 +43,7 @@ for arg in "$@"; do
 done
 
 ############################################
-# LOGGING
+# LOG
 ############################################
 
 log() {
@@ -51,63 +51,100 @@ log() {
 }
 
 ############################################
-# NODE INPUT
+# TERMINAL UI INPUT
 ############################################
 
 tui() {
-  MODE=$(whiptail --title "InfraPilot" --menu "Select Mode" 15 60 3 \
-    "1" "Single VPS" \
-    "2" "Swarm Mode" \
-    "3" "Explain Mode" 3>&1 1>&2 2>&3)
+  echo "======================================"
+  echo "         InfraPilot Launcher"
+  echo "======================================"
+  echo "1) Single VPS"
+  echo "2) Swarm Mode"
+  echo "3) Explain Mode"
+  echo ""
 
-  case "$MODE" in
+  read -rp "Select mode: " mode
+
+  case "$mode" in
     1)
-      NODE=$(whiptail --inputbox "Enter VPS (user@ip)" 10 60 3>&1 1>&2 2>&3)
+      read -rp "Enter VPS (user@ip): " NODE
       export NODES_INPUT="$NODE"
+      SWARM=false
       ;;
     2)
-      NODE=$(whiptail --inputbox "Enter VPS list (comma separated)" 10 60 3>&1 1>&2 2>&3)
+      read -rp "Enter VPS list (comma separated): " NODE
       export NODES_INPUT="$NODE"
       SWARM=true
       ;;
     3)
-      NODE=$(whiptail --inputbox "Enter VPS list" 10 60 3>&1 1>&2 2>&3)
+      read -rp "Enter VPS list (comma separated): " NODE
       export NODES_INPUT="$NODE"
       EXPLAIN=true
       ;;
   esac
 }
 
+############################################
+# NODE LOADER
+############################################
+
 load_nodes() {
   IFS=',' read -ra NODES <<< "$NODES_INPUT"
 }
 
 ############################################
-# SSH STATE
+# SINGLE / SWARM MODE EXECUTION FLOW
+############################################
+
+run_mode() {
+  mkdir -p "$STATE_DIR"
+
+  if [[ "$SWARM" == true ]]; then
+    log "Swarm mode enabled"
+
+    for n in "${NODES[@]}"; do
+      scan_node "$n" &
+    done
+    wait
+
+    STATE=$(build_state)
+  else
+    log "Single VPS mode"
+
+    NODE="${NODES[0]}"
+
+    STATE_FILE="/tmp/infrapilot_single.json"
+
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$NODE" bash <<'EOF' > "$STATE_FILE"
+{
+  "host": "$(hostname)",
+  "uptime": "$(uptime)",
+  "disk": "$(df -h)",
+  "mem": "$(free -m)"
+}
+EOF
+
+    STATE="$STATE_FILE"
+  fi
+}
+
+############################################
+# SSH SCAN
 ############################################
 
 scan_node() {
   local node="$1"
   local out="$STATE_DIR/$(echo "$node" | tr '@./' '_').json"
 
-  mkdir -p "$STATE_DIR"
-
   ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$node" bash <<'EOF' > "$out"
 {
   "host": "$(hostname)",
   "uptime": "$(uptime)",
-  "disk": "$(df -h | head -10 | tr '\n' ' ')",
-  "mem": "$(free -m | tr '\n' ' ')",
-  "cpu": "$(top -bn1 | head -10 | tr '\n' ' ')"
+  "disk": "$(df -h)",
+  "mem": "$(free -m)",
+  "cpu": "$(top -bn1 | head -5)"
 }
 EOF
-}
-
-collect() {
-  for n in "${NODES[@]}"; do
-    scan_node "$n" &
-  done
-  wait
 }
 
 build_state() {
@@ -123,13 +160,13 @@ build_state() {
 }
 
 ############################################
-# LLM
+# LLM CALL
 ############################################
 
 call_llm() {
   local state="$1"
-
   local mode_text="Return ONLY JSON actions."
+
   $EXPLAIN && mode_text="Explain only. No actions."
 
   curl -s "$API_URL" \
@@ -139,32 +176,36 @@ call_llm() {
       \"model\": \"$MODEL\",
       \"temperature\": 0,
       \"messages\": [
-        {\"role\": \"system\", \"content\": \"InfraPilot JSON controller\"},
-        {\"role\": \"user\", \"content\": \"$mode_text\n\nSTATE:\n$(cat "$state")\"}
+        {
+          \"role\": \"system\",
+          \"content\": \"InfraPilot JSON controller\"
+        },
+        {
+          \"role\": \"user\",
+          \"content\": \"$mode_text\n\nSTATE:\n$(cat "$state")\"
+        }
       ]
     }"
 }
 
 ############################################
-# APPROVAL CACHE CORE
+# APPROVAL CACHE
 ############################################
-
-fingerprint() {
-  echo "$1|$2|$3|$4" | sha256sum | awk '{print $1}'
-}
 
 cache_init() {
   [[ -f "$CACHE_FILE" ]] || echo "{}" > "$CACHE_FILE"
 }
 
+fingerprint() {
+  echo "$1|$2|$3|$4" | sha256sum | awk '{print $1}'
+}
+
 cache_check() {
-  local fp="$1"
-  jq -e --arg fp "$fp" '.[$fp]' "$CACHE_FILE" >/dev/null 2>&1
+  jq -e --arg fp "$1" '.[$fp]' "$CACHE_FILE" >/dev/null 2>&1
 }
 
 cache_get() {
-  local fp="$1"
-  jq -r --arg fp "$fp" '.[$fp].decision' "$CACHE_FILE"
+  jq -r --arg fp "$1" '.[$fp].decision' "$CACHE_FILE"
 }
 
 cache_save() {
@@ -211,7 +252,7 @@ filter_actions() {
 }
 
 ############################################
-# APPROVAL ENGINE (WITH CACHE)
+# APPROVAL UI (NO POPUPS, FULL TERMINAL)
 ############################################
 
 approve_actions() {
@@ -223,39 +264,85 @@ approve_actions() {
 
   mapfile -t actions < "$file"
 
-  for a in "${actions[@]}"; do
+  echo ""
+  echo "======================================"
+  echo "        InfraPilot Approval UI"
+  echo "======================================"
+  echo ""
 
+  i=1
+  for a in "${actions[@]}"; do
     node=$(echo "$a" | jq -r '.node')
     type=$(echo "$a" | jq -r '.type')
     svc=$(echo "$a" | jq -r '.service // "-"')
-    cmd=$(echo "$a" | jq -r '.command // "-"')
 
-    fp=$(fingerprint "$node" "$type" "$svc" "$cmd")
+    echo "[$i] $node | $type | $svc"
+    ((i++))
+  done
 
-    # CACHE HIT
-    if cache_check "$fp"; then
-      decision=$(cache_get "$fp")
+  echo ""
+  echo "Commands:"
+  echo "  a <n>   approve"
+  echo "  r <n>   reject"
+  echo "  all     approve cached-safe"
+  echo "  q       continue"
+  echo ""
 
-      log "[CACHE] $node $type → $decision"
+  while true; do
+    read -rp "InfraPilot> " cmd idx
 
-      if [[ "$decision" == "approve" ]]; then
+    case "$cmd" in
+
+      a)
+        a="${actions[$((idx-1))]}"
+
+        node=$(echo "$a" | jq -r '.node')
+        type=$(echo "$a" | jq -r '.type')
+        svc=$(echo "$a" | jq -r '.service // "-"')
+        cmdx=$(echo "$a" | jq -r '.command // "-"')
+
+        fp=$(fingerprint "$node" "$type" "$svc" "$cmdx")
+
+        cache_save "$fp" "approve"
         echo "$a" >> "$approved"
-      fi
-      continue
-    fi
 
-    # HUMAN APPROVAL
-    whiptail --yesno "Approve action?\n\nNode: $node\nType: $type\nService: $svc" 15 60
+        log "Approved $node $type"
+        ;;
 
-    if [[ $? -eq 0 ]]; then
-      cache_save "$fp" "approve"
-      echo "$a" >> "$approved"
-      log "Approved $type on $node"
-    else
-      cache_save "$fp" "reject"
-      log "Rejected $type on $node"
-    fi
+      r)
+        a="${actions[$((idx-1))]}"
 
+        node=$(echo "$a" | jq -r '.node')
+        type=$(echo "$a" | jq -r '.type')
+        svc=$(echo "$a" | jq -r '.service // "-"')
+        cmdx=$(echo "$a" | jq -r '.command // "-"')
+
+        fp=$(fingerprint "$node" "$type" "$svc" "$cmdx")
+
+        cache_save "$fp" "reject"
+
+        log "Rejected $node $type"
+        ;;
+
+      all)
+        for a in "${actions[@]}"; do
+          node=$(echo "$a" | jq -r '.node')
+          type=$(echo "$a" | jq -r '.type')
+          svc=$(echo "$a" | jq -r '.service // "-"')
+          cmdx=$(echo "$a" | jq -r '.command // "-"')
+
+          fp=$(fingerprint "$node" "$type" "$svc" "$cmdx")
+
+          if cache_check "$fp" && [[ "$(cache_get "$fp")" == "approve" ]]; then
+            echo "$a" >> "$approved"
+          fi
+        done
+        ;;
+
+      q)
+        break
+        ;;
+    esac
   done
 
   echo "$approved"
@@ -269,7 +356,7 @@ execute() {
   local file="$1"
 
   if $EXPLAIN; then
-    log "Explain mode active"
+    log "Explain mode"
     cat "$file"
     return
   fi
@@ -281,7 +368,6 @@ execute() {
     case "$type" in
       restart_service)
         svc=$(echo "$action" | jq -r '.service')
-        log "Restart $svc on $node"
         ssh -i "$SSH_KEY" "$node" "systemctl restart $svc" || true
         ;;
       cleanup)
@@ -303,11 +389,7 @@ main() {
 
   log "Starting InfraPilot"
 
-  mkdir -p "$STATE_DIR"
-
-  collect
-
-  STATE=$(build_state)
+  run_mode
 
   raw=$(call_llm "$STATE")
 
