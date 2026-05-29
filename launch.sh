@@ -7,7 +7,7 @@ set -euo pipefail
 
 API_URL="https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL="step-3.5-flash"
-API_KEY="${NIM_API_KEY:-}"
+API_KEY="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"
 
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_rsa}"
 
