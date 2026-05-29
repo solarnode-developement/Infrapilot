@@ -108,21 +108,21 @@ run_mode() {
     wait
 
     STATE=$(build_state)
-  else
-    log "Single VPS mode"
 
-    NODE="${NODES[0]}"
+  else
+    log "Single VPS mode (local host)"
 
     STATE_FILE="/tmp/infrapilot_single.json"
 
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$NODE" bash <<'EOF' > "$STATE_FILE"
-{
-  "host": "$(hostname)",
-  "uptime": "$(uptime)",
-  "disk": "$(df -h)",
-  "mem": "$(free -m)"
-}
-EOF
+    {
+      echo "{"
+      echo "\"host\": \"$(hostname)\","
+      echo "\"uptime\": \"$(uptime)\","
+      echo "\"disk\": \"$(df -h | head -5)\","
+      echo "\"mem\": \"$(free -m)\","
+      echo "\"cpu\": \"$(top -bn1 | head -5)\"
+      echo "}"
+    } > "$STATE_FILE"
 
     STATE="$STATE_FILE"
   fi
