@@ -1,4 +1,3 @@
-cat > infrapilot.sh << 'SCRIPT'
 #!/bin/bash
 set -euo pipefail
 
@@ -44,6 +43,16 @@ success() {
     local msg="$1"
     echo "[✓] $msg"
     log "[SUCCESS] $msg"
+}
+
+###########################################
+# JSON Escaping Helper
+###########################################
+
+json_escape() {
+    local str="$1"
+    # Use jq to safely escape the string
+    echo -n "$str" | jq -Rs .
 }
 
 ###########################################
@@ -131,13 +140,19 @@ collect_state_local() {
     mem_free=$(free -m 2>/dev/null | awk 'NR==2 {print $7"MB"}' || echo "unknown")
     disk_free=$(df -h / 2>/dev/null | awk 'NR==2 {print $4}' || echo "unknown")
     
+    local uptime_esc load_esc mem_esc disk_esc
+    uptime_esc=$(json_escape "$uptime")
+    load_esc=$(json_escape "$load")
+    mem_esc=$(json_escape "$mem_free")
+    disk_esc=$(json_escape "$disk_free")
+    
     cat <<EOF
 {
   "host": "localhost",
-  "uptime": "$(echo "$uptime" | jq -Rs .)",
-  "load": "$(echo "$load" | jq -Rs .)",
-  "disk_free": "$(echo "$disk_free" | jq -Rs .)",
-  "mem_free": "$(echo "$mem_free" | jq -Rs .)"
+  "uptime": $uptime_esc,
+  "load": $load_esc,
+  "disk_free": $disk_esc,
+  "mem_free": $mem_esc
 }
 EOF
 }
@@ -161,13 +176,20 @@ collect_state_remote() {
         disk_free="unknown"
     fi
     
+    local node_esc uptime_esc load_esc mem_esc disk_esc
+    node_esc=$(json_escape "$node")
+    uptime_esc=$(json_escape "$uptime")
+    load_esc=$(json_escape "$load")
+    mem_esc=$(json_escape "$mem_free")
+    disk_esc=$(json_escape "$disk_free")
+    
     cat <<EOF
 {
-  "host": "$(echo "$node" | jq -Rs .)",
-  "uptime": "$(echo "$uptime" | jq -Rs .)",
-  "load": "$(echo "$load" | jq -Rs .)",
-  "disk_free": "$(echo "$disk_free" | jq -Rs .)",
-  "mem_free": "$(echo "$mem_free" | jq -Rs .)"
+  "host": $node_esc,
+  "uptime": $uptime_esc,
+  "load": $load_esc,
+  "disk_free": $disk_esc,
+  "mem_free": $mem_esc
 }
 EOF
 }
@@ -186,7 +208,7 @@ collect_state() {
     fi
     
     local state
-    state=$(printf '%s\n' "${state_nodes[@]}" | jq -s '{nodes: .}')
+    state=$(printf '%s\n' "${state_nodes[@]}" | jq -s '{nodes: .}' 2>/dev/null)
     
     if ! echo "$state" | jq empty 2>/dev/null; then
         err "invalid state JSON generated"
@@ -206,6 +228,9 @@ call_llm() {
     
     log "calling NVIDIA API..."
     
+    local state_escaped
+    state_escaped=$(echo "$state" | jq -Rs .)
+    
     local prompt="You are an infrastructure automation agent. Analyze this system state and return ONLY a JSON array of actions. Do not include any other text.
 
 System State:
@@ -216,20 +241,20 @@ Return actions as JSON array with schema: [{\"node\": \"hostname/localhost\", \"
 Generate 0-3 safe, non-destructive actions based on the state. Return empty array if no actions needed. Return ONLY the JSON array."
 
     local payload
-    payload=$(cat <<EOF | jq -c .
-{
-  "model": "stepfun-ai/step-3.5-flash",
-  "messages": [
-    {
-      "role": "user",
-      "content": "$prompt"
-    }
-  ],
-  "temperature": 0.3,
-  "max_tokens": 500
-}
-EOF
-)
+    payload=$(jq -n \
+        --arg model "stepfun-ai/step-3.5-flash" \
+        --arg prompt "$prompt" \
+        '{
+            model: $model,
+            messages: [
+                {
+                    role: "user",
+                    content: $prompt
+                }
+            ],
+            temperature: 0.3,
+            max_tokens: 500
+        }')
 
     local response
     if ! response=$(curl -s -X POST \
@@ -243,7 +268,7 @@ EOF
     fi
     
     if ! echo "$response" | jq empty 2>/dev/null; then
-        err "invalid LLM response"
+        err "invalid LLM response: $response"
         return 1
     fi
     
@@ -255,21 +280,14 @@ EOF
         return 1
     fi
     
-    local json_start
-    json_start=$(echo "$content" | grep -o '\[' | head -1)
-    
-    if [[ -z "$json_start" ]]; then
-        log "no actions returned by LLM"
-        echo "[]"
-        return 0
-    fi
-    
+    # Extract JSON array from response
     local actions
-    actions=$(echo "$content" | sed -n '/^\[/,/^\]/p' | head -1)
+    actions=$(echo "$content" | grep -oP '^\[.*\]$' || echo "[]")
     
     if ! echo "$actions" | jq empty 2>/dev/null; then
-        err "invalid actions JSON from LLM"
-        return 1
+        log "no valid actions in LLM response"
+        echo "[]"
+        return 0
     fi
     
     echo "$actions"
@@ -387,7 +405,6 @@ approval_ui() {
     fi
     
     declare -ga ACTIONS=()
-    local approved_indices=()
     
     for ((i=0; i<count; i++)); do
         local node type service command fingerprint
@@ -402,7 +419,6 @@ approval_ui() {
         if check_cached_decision "$fingerprint"; then
             log "action $i: approved from cache"
             ACTIONS+=("$i")
-            approved_indices+=("$i")
             continue
         fi
         
@@ -426,7 +442,6 @@ approval_ui() {
                 y|Y)
                     cache_decision "$fingerprint" "approved"
                     ACTIONS+=("$i")
-                    approved_indices+=("$i")
                     log "action $i: approved by user"
                     break
                     ;;
@@ -530,226 +545,7 @@ main() {
     local state
     state=$(collect_state) || exit 1
     
-    local actions
-    actions=$(call_llm "$state") || exit 1
-    
-    validate_actions "$actions" || exit 1
-    
-    approval_ui "$actions"
-    
-    execute_actions "$actions"
-    
-    success "InfraPilot run complete"
-    log "see full log: $LOG_FILE"
-}
-
-###########################################
-# CLI Entry Point
-###########################################
-
-usage() {
-    cat <<EOF
-Usage: $0 [options]
-
-Options:
-  -m, --mode MODE              single or swarm (required)
-  -n, --nodes NODES            comma-separated nodes for swarm mode
-  -k, --ssh-key PATH           path to SSH private key (required for swarm)
-  -h, --help                   show this help
-
-Environment Variables:
-  NVIDIA_API_KEY               required
-  NVIDIA_API_ENDPOINT          optional, defaults to NVIDIA integration endpoint
-  SSH_KEY                      optional, path to SSH key
-
-Example:
-  export NVIDIA_API_KEY="nvapi-..."
-  $0 -m single
-
-  export NVIDIA_API_KEY="nvapi-..."
-  $0 -m swarm -n "user@host1,user@host2" -k ~/.ssh/id_rsa
-
-EOF
-    exit 0
-}
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -m|--mode)
-            MODE="$2"
-            shift 2
-            ;;
-        -n|--nodes)
-            IFS=',' read -ra NODES <<< "$2"
-            shift 2
-            ;;
-        -k|--ssh-key)
-            SSH_KEY="$2"
-            shift 2
-            ;;
-        -h|--help)
-            usage
-            ;;
-        *)
-            err "unknown option: $1"
-            usage
-            ;;
-    esac
-done
-
-main "$@"
-SCRIPT
-chmod +x infrapilot.sh
-./infrapilot.sh -m single'length')
-    
-    if [[ $count -eq 0 ]]; then
-        log "no actions to approve"
-        return 0
-    fi
-    
-    declare -ga ACTIONS=()
-    local approved_indices=()
-    
-    for ((i=0; i<count; i++)); do
-        local node type service command fingerprint
-        
-        node=$(echo "$actions" | jq -r ".[$i].node")
-        type=$(echo "$actions" | jq -r ".[$i].type")
-        service=$(echo "$actions" | jq -r ".[$i].service // \"\"")
-        command=$(echo "$actions" | jq -r ".[$i].command // \"\"")
-        
-        fingerprint=$(get_action_fingerprint "$node" "$type" "$service" "$command")
-        
-        if check_cached_decision "$fingerprint"; then
-            log "action $i: approved from cache"
-            ACTIONS+=("$i")
-            approved_indices+=("$i")
-            continue
-        fi
-        
-        echo ""
-        echo "════════════════════════════════════"
-        echo "Action $((i+1))/$count"
-        echo "════════════════════════════════════"
-        echo "Node:    $node"
-        echo "Type:    $type"
-        if [[ -n "$service" ]]; then
-            echo "Service: $service"
-        fi
-        if [[ -n "$command" ]]; then
-            echo "Command: $command"
-        fi
-        echo ""
-        
-        while true; do
-            read -p "Approve? (y/n/s for skip): " -r choice
-            case "$choice" in
-                y|Y)
-                    cache_decision "$fingerprint" "approved"
-                    ACTIONS+=("$i")
-                    approved_indices+=("$i")
-                    log "action $i: approved by user"
-                    break
-                    ;;
-                n|N)
-                    cache_decision "$fingerprint" "rejected"
-                    log "action $i: rejected by user"
-                    break
-                    ;;
-                s|S)
-                    log "action $i: skipped by user"
-                    break
-                    ;;
-                *)
-                    echo "invalid choice"
-                    ;;
-            esac
-        done
-    done
-    
-    echo ""
-    echo "════════════════════════════════════"
-    echo "Summary: $(echo "${#ACTIONS[@]}") actions approved out of $count"
-    echo "════════════════════════════════════"
-    echo ""
-}
-
-###########################################
-# Action Execution
-###########################################
-
-execute_action() {
-    local node="$1" type="$2" service="$3" command="$4"
-    
-    local cmd_to_run=""
-    
-    case "$type" in
-        restart_service)
-            cmd_to_run="systemctl restart $service"
-            ;;
-        cleanup|shell)
-            cmd_to_run="$command"
-            ;;
-        *)
-            err "unknown action type: $type"
-            return 1
-            ;;
-    esac
-    
-    log "executing: [$node] $type"
-    
-    if [[ "$node" == "localhost" ]]; then
-        if ! eval "$cmd_to_run" 2>&1 | tee -a "$LOG_FILE"; then
-            err "execution failed on localhost"
-            return 1
-        fi
-    else
-        if ! ssh $SSH_OPTS -i "$SSH_KEY" "$node" "$cmd_to_run" 2>&1 | tee -a "$LOG_FILE"; then
-            err "execution failed on $node"
-            return 1
-        fi
-    fi
-    
-    success "executed: [$node] $type"
-    return 0
-}
-
-execute_actions() {
-    local actions="$1"
-    
-    if [[ ${#ACTIONS[@]} -eq 0 ]]; then
-        log "no actions to execute"
-        return 0
-    fi
-    
-    log "executing ${#ACTIONS[@]} approved actions..."
-    
-    for idx in "${ACTIONS[@]}"; do
-        local node type service command
-        
-        node=$(echo "$actions" | jq -r ".[$idx].node")
-        type=$(echo "$actions" | jq -r ".[$idx].type")
-        service=$(echo "$actions" | jq -r ".[$idx].service // \"\"")
-        command=$(echo "$actions" | jq -r ".[$idx].command // \"\"")
-        
-        execute_action "$node" "$type" "$service" "$command" || true
-    done
-    
-    success "execution phase complete"
-}
-
-###########################################
-# Main Pipeline
-###########################################
-
-main() {
-    log "InfraPilot v$SCRIPT_VERSION starting..."
-    
-    check_dependencies || exit 1
-    validate_inputs || exit 1
-    
-    local state
-    state=$(collect_state) || exit 1
+    log "state: $state"
     
     local actions
     actions=$(call_llm "$state") || exit 1
@@ -784,10 +580,8 @@ Environment Variables:
   SSH_KEY                      optional, path to SSH key
 
 Example:
-  export NVIDIA_API_KEY="nvapi-..."
   $0 -m single
 
-  export NVIDIA_API_KEY="nvapi-..."
   $0 -m swarm -n "user@host1,user@host2" -k ~/.ssh/id_rsa
 
 EOF
