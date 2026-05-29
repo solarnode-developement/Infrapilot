@@ -7,35 +7,40 @@ set -euo pipefail
 
 API_URL="https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL="step-3.5-flash"
-API_KEY="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"
+API_KEY="${NIM_API_KEY:-}"
 
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_rsa}"
 
-NODES=(
-  "root@vps1.example.com"
-  "root@vps2.example.com"
-  "root@vps3.example.com"
-)
-
-AGENTS=("auditor" "optimizer" "ops" "safety" "orchestrator")
-
 STATE_DIR="/tmp/infrapilot_state"
-SNAP_DIR="/tmp/infrapilot_snapshots"
+CACHE_FILE="/tmp/infrapilot_approval_cache.json"
 LOG="/tmp/infrapilot.log"
 
 EXPLAIN=false
-SWARM_BETA=false
+SWARM=false
+
+NODES=()
+
+############################################
+# DEPENDENCIES
+############################################
+
+require_deps() {
+  for cmd in jq ssh curl whiptail sha256sum; do
+    command -v "$cmd" >/dev/null 2>&1 || {
+      echo "[InfraPilot] installing $cmd..."
+      apt update && apt install -y jq openssh-client curl whiptail coreutils || true
+    }
+  done
+}
 
 ############################################
 # FLAGS
 ############################################
 
 for arg in "$@"; do
+  [[ "$arg" == "--swarm" ]] && SWARM=true
   [[ "$arg" == "--why" ]] && EXPLAIN=true
-  [[ "$arg" == "--swarm-beta" ]] && SWARM_BETA=true
 done
-
-mkdir -p "$STATE_DIR" "$SNAP_DIR"
 
 ############################################
 # LOGGING
@@ -46,43 +51,66 @@ log() {
 }
 
 ############################################
-# SSH POOL (simple but parallel)
+# NODE INPUT
 ############################################
 
-ssh_run() {
-  local node="$1"
-  local cmd="$2"
+tui() {
+  MODE=$(whiptail --title "InfraPilot" --menu "Select Mode" 15 60 3 \
+    "1" "Single VPS" \
+    "2" "Swarm Mode" \
+    "3" "Explain Mode" 3>&1 1>&2 2>&3)
 
-  ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-    "$node" "$cmd" 2>/dev/null || true
+  case "$MODE" in
+    1)
+      NODE=$(whiptail --inputbox "Enter VPS (user@ip)" 10 60 3>&1 1>&2 2>&3)
+      export NODES_INPUT="$NODE"
+      ;;
+    2)
+      NODE=$(whiptail --inputbox "Enter VPS list (comma separated)" 10 60 3>&1 1>&2 2>&3)
+      export NODES_INPUT="$NODE"
+      SWARM=true
+      ;;
+    3)
+      NODE=$(whiptail --inputbox "Enter VPS list" 10 60 3>&1 1>&2 2>&3)
+      export NODES_INPUT="$NODE"
+      EXPLAIN=true
+      ;;
+  esac
 }
+
+load_nodes() {
+  IFS=',' read -ra NODES <<< "$NODES_INPUT"
+}
+
+############################################
+# SSH STATE
+############################################
 
 scan_node() {
   local node="$1"
-  local file="$STATE_DIR/$(echo "$node" | tr '@./' '_').json"
+  local out="$STATE_DIR/$(echo "$node" | tr '@./' '_').json"
 
-  log "Scanning $node"
+  mkdir -p "$STATE_DIR"
 
-  ssh_run "$node" "bash -s" <<'EOF' > "$file"
+  ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$node" bash <<'EOF' > "$out"
 {
   "host": "$(hostname)",
   "uptime": "$(uptime)",
   "disk": "$(df -h | head -10 | tr '\n' ' ')",
   "mem": "$(free -m | tr '\n' ' ')",
-  "cpu": "$(top -bn1 | head -10 | tr '\n' ' ')",
-  "services": "$(systemctl list-units --type=service --state=running | head -20 | tr '\n' ' ')"
+  "cpu": "$(top -bn1 | head -10 | tr '\n' ' ')"
 }
 EOF
 }
 
-collect_cluster() {
+collect() {
   for n in "${NODES[@]}"; do
     scan_node "$n" &
   done
   wait
 }
 
-build_global_state() {
+build_state() {
   local out="/tmp/infrapilot_global.json"
   echo "{" > "$out"
 
@@ -95,66 +123,14 @@ build_global_state() {
 }
 
 ############################################
-# SNAPSHOT + ROLLBACK GRAPH (simple version)
-############################################
-
-snapshot_cluster() {
-  local id
-  id=$(date +%s)
-
-  mkdir -p "$SNAP_DIR/$id"
-
-  log "Creating snapshot $id"
-
-  for n in "${NODES[@]}"; do
-    ssh_run "$n" "systemctl list-units --type=service" > "$SNAP_DIR/$id/${n//[@./]/_}_services.txt"
-    ssh_run "$n" "df -h" > "$SNAP_DIR/$id/${n//[@./]/_}_disk.txt"
-  done
-
-  echo "$id" > "$SNAP_DIR/latest"
-}
-
-rollback_cluster() {
-  [[ ! -f "$SNAP_DIR/latest" ]] && echo "No snapshot" && exit 1
-
-  local id
-  id=$(cat "$SNAP_DIR/latest")
-
-  log "Rolling back cluster to $id (manual restore only)"
-
-  # NOTE: real systems would restore configs, not just logs
-  for n in "${NODES[@]}"; do
-    log "No-op rollback hook for $n (extend for real infra)"
-  done
-}
-
-############################################
-# LLM CALL
+# LLM
 ############################################
 
 call_llm() {
   local state="$1"
 
-  local mode_prompt
-
-  if $EXPLAIN; then
-    mode_prompt="Explain system state only. No actions."
-  else
-    mode_prompt="Return STRICT JSON ONLY:
-{
-  \"actions\": [
-    {
-      \"node\": \"root@vps1.example.com\",
-      \"type\": \"restart_service\",
-      \"service\": \"nginx\",
-      \"reason\": \"string\"
-    }
-  ]
-}"
-  fi
-
-  local payload
-  payload=$(cat "$state")
+  local mode_text="Return ONLY JSON actions."
+  $EXPLAIN && mode_text="Explain only. No actions."
 
   curl -s "$API_URL" \
     -H "Authorization: Bearer $API_KEY" \
@@ -163,32 +139,61 @@ call_llm() {
       \"model\": \"$MODEL\",
       \"temperature\": 0,
       \"messages\": [
-        {
-          \"role\": \"system\",
-          \"content\": \"You are InfraPilot. You output only valid JSON.\"
-        },
-        {
-          \"role\": \"user\",
-          \"content\": $(echo "$mode_prompt\n\nSTATE:\n$payload" | jq -Rs .)
-        }
+        {\"role\": \"system\", \"content\": \"InfraPilot JSON controller\"},
+        {\"role\": \"user\", \"content\": \"$mode_text\n\nSTATE:\n$(cat "$state")\"}
       ]
     }"
 }
 
 ############################################
-# VALIDATION LAYER
+# APPROVAL CACHE CORE
 ############################################
 
-is_safe_service() {
+fingerprint() {
+  echo "$1|$2|$3|$4" | sha256sum | awk '{print $1}'
+}
+
+cache_init() {
+  [[ -f "$CACHE_FILE" ]] || echo "{}" > "$CACHE_FILE"
+}
+
+cache_check() {
+  local fp="$1"
+  jq -e --arg fp "$fp" '.[$fp]' "$CACHE_FILE" >/dev/null 2>&1
+}
+
+cache_get() {
+  local fp="$1"
+  jq -r --arg fp "$fp" '.[$fp].decision' "$CACHE_FILE"
+}
+
+cache_save() {
+  local fp="$1"
+  local decision="$2"
+
+  tmp=$(mktemp)
+
+  jq --arg fp "$fp" --arg d "$decision" \
+    '.[$fp] = {"decision": $d, "ts": (now|floor)}' \
+    "$CACHE_FILE" > "$tmp"
+
+  mv "$tmp" "$CACHE_FILE"
+}
+
+############################################
+# SAFETY FILTER
+############################################
+
+safe_service() {
   case "$1" in
     nginx|docker|redis) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-validate() {
+filter_actions() {
   local input="$1"
-  local out="/tmp/infrapilot_valid.json"
+  local out="/tmp/infrapilot_filtered.json"
   > "$out"
 
   echo "$input" | jq -c '.actions[]?' 2>/dev/null | while read -r a; do
@@ -196,7 +201,7 @@ validate() {
 
     if [[ "$type" == "restart_service" ]]; then
       svc=$(echo "$a" | jq -r '.service')
-      is_safe_service "$svc" && echo "$a" >> "$out" || log "BLOCKED $svc"
+      safe_service "$svc" && echo "$a" >> "$out"
     else
       echo "$a" >> "$out"
     fi
@@ -206,19 +211,68 @@ validate() {
 }
 
 ############################################
-# EXECUTION ENGINE
+# APPROVAL ENGINE (WITH CACHE)
+############################################
+
+approve_actions() {
+  local file="$1"
+  local approved="/tmp/infrapilot_approved.json"
+  > "$approved"
+
+  cache_init
+
+  mapfile -t actions < "$file"
+
+  for a in "${actions[@]}"; do
+
+    node=$(echo "$a" | jq -r '.node')
+    type=$(echo "$a" | jq -r '.type')
+    svc=$(echo "$a" | jq -r '.service // "-"')
+    cmd=$(echo "$a" | jq -r '.command // "-"')
+
+    fp=$(fingerprint "$node" "$type" "$svc" "$cmd")
+
+    # CACHE HIT
+    if cache_check "$fp"; then
+      decision=$(cache_get "$fp")
+
+      log "[CACHE] $node $type → $decision"
+
+      if [[ "$decision" == "approve" ]]; then
+        echo "$a" >> "$approved"
+      fi
+      continue
+    fi
+
+    # HUMAN APPROVAL
+    whiptail --yesno "Approve action?\n\nNode: $node\nType: $type\nService: $svc" 15 60
+
+    if [[ $? -eq 0 ]]; then
+      cache_save "$fp" "approve"
+      echo "$a" >> "$approved"
+      log "Approved $type on $node"
+    else
+      cache_save "$fp" "reject"
+      log "Rejected $type on $node"
+    fi
+
+  done
+
+  echo "$approved"
+}
+
+############################################
+# EXECUTION
 ############################################
 
 execute() {
   local file="$1"
 
   if $EXPLAIN; then
-    log "Explain mode: no execution"
+    log "Explain mode active"
     cat "$file"
     return
   fi
-
-  log "Executing plan..."
 
   while read -r action; do
     node=$(echo "$action" | jq -r '.node')
@@ -228,36 +282,14 @@ execute() {
       restart_service)
         svc=$(echo "$action" | jq -r '.service')
         log "Restart $svc on $node"
-        ssh_run "$node" "systemctl restart $svc"
+        ssh -i "$SSH_KEY" "$node" "systemctl restart $svc" || true
         ;;
       cleanup)
         cmd=$(echo "$action" | jq -r '.command')
-        log "Cleanup on $node"
-        ssh_run "$node" "$cmd"
+        ssh -i "$SSH_KEY" "$node" "$cmd" || true
         ;;
     esac
   done < "$file"
-}
-
-############################################
-# SWARM SUPER-AGENT MODE (simplified)
-############################################
-
-superagent() {
-  local state="$1"
-
-  log "Running SuperAgent mode (parallel reasoning)"
-
-  local auditor optimizer ops safety orchestrator
-
-  auditor=$(call_llm "$state")
-  optimizer=$(call_llm "$state")
-  ops=$(call_llm "$state")
-  safety=$(call_llm "$state")
-
-  orchestrator=$(echo "$auditor $optimizer $ops $safety" | jq -Rs .)
-
-  echo "$orchestrator"
 }
 
 ############################################
@@ -265,33 +297,30 @@ superagent() {
 ############################################
 
 main() {
-  [[ -z "$API_KEY" ]] && echo "Missing API key" && exit 1
+  require_deps
+  tui
+  load_nodes
 
-  log "InfraPilot v6 starting"
+  log "Starting InfraPilot"
 
-  collect_cluster
+  mkdir -p "$STATE_DIR"
 
-  global=$(build_global_state)
+  collect
 
-  if $SWARM_BETA; then
-    raw=$(superagent "$global")
-  else
-    raw=$(call_llm "$global")
-  fi
+  STATE=$(build_state)
 
-  echo "$raw" > /tmp/infrapilot_raw.json
+  raw=$(call_llm "$STATE")
 
   content=$(echo "$raw" | jq -r '.choices[0].message.content')
-
   echo "$content" > /tmp/infrapilot_actions.json
 
-  valid=$(validate "$content")
+  filtered=$(filter_actions "/tmp/infrapilot_actions.json")
 
-  snapshot_cluster
+  approved=$(approve_actions "$filtered")
 
-  execute "$valid"
+  execute "$approved"
 
-  log "InfraPilot done"
+  log "Done"
 }
 
 main "$@"
